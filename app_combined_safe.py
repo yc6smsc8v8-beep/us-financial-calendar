@@ -21,10 +21,15 @@ FEED_PATH = "/us_financial_calendar.ics"
 INCLUDE_ALL_EARNINGS_ENV = os.getenv("INCLUDE_ALL_EARNINGS", "0") == "1"
 AUTO_EXPAND_EARNINGS = os.getenv("AUTO_EXPAND_EARNINGS", "0") == "1"  # auto include-all if S&P500 list missing
 
-# Endpoints (stable)
+# TE fallback config
+USE_TE_FALLBACK = os.getenv("USE_TE_FALLBACK", "0") == "1"
+TE_CRED = os.getenv("TE_CRED", "guest:guest")  # "user:pass" or api key
+
+# Endpoints
 FMP_STABLE_BASE = "https://financialmodelingprep.com/stable"
 FMP_V3_BASE = "https://financialmodelingprep.com/api/v3"  # S&P500 list
-UA = {"User-Agent": "US-Financial-ICS/1.5"}
+TE_BASE = "https://api.tradingeconomics.com"
+UA = {"User-Agent": "US-Financial-ICS/1.6"}
 
 # Cache
 _cache = {"ics": None, "ts": 0}
@@ -90,7 +95,7 @@ def fetch_earnings_calendar(from_date: str, to_date: str) -> List[dict]:
             continue
     return results
 
-def fetch_economic_calendar(from_date: str, to_date: str) -> List[dict]:
+def fetch_economic_calendar_fmp(from_date: str, to_date: str) -> List[dict]:
     results = []
     start = datetime.fromisoformat(from_date)
     end = datetime.fromisoformat(to_date)
@@ -98,6 +103,22 @@ def fetch_economic_calendar(from_date: str, to_date: str) -> List[dict]:
         try:
             r = _get(f"{FMP_STABLE_BASE}/economic-calendar",
                      params={"from": s.date().isoformat(), "to": e.date().isoformat(), "apikey": FMP_API_KEY})
+            if r:
+                data = r.json()
+                if isinstance(data, list):
+                    results.extend(data)
+        except Exception:
+            continue
+    return results
+
+def fetch_economic_calendar_te(from_date: str, to_date: str) -> List[dict]:
+    results = []
+    start = datetime.fromisoformat(from_date)
+    end = datetime.fromisoformat(to_date)
+    for s, e in daterange_chunks(start, end, step_days=60):
+        try:
+            r = _get(f"{TE_BASE}/calendar/country/united states",
+                     params={"d1": s.date().isoformat(), "d2": e.date().isoformat(), "c": TE_CRED, "format": "json"})
             if r:
                 data = r.json()
                 if isinstance(data, list):
@@ -138,33 +159,59 @@ def collect_combined_events() -> List[dict]:
     to_date = today + timedelta(days=LOOKAHEAD_DAYS)
     from_str, to_str = today.isoformat(), to_date.isoformat()
 
-    # Economic (US only)
-    econ = fetch_economic_calendar(from_str, to_str)
+    # --- Economic: FMP first, TE fallback if enabled/empty ---
+    econ = fetch_economic_calendar_fmp(from_str, to_str)
+    used_te = False
+    if USE_TE_FALLBACK and not econ:
+        te = fetch_economic_calendar_te(from_str, to_str)
+        # map TE to FMP-like fields
+        for item in te:
+            if (item.get("Country") or "").lower() != "united states":
+                continue
+            name = item.get("Event") or item.get("Category") or "Economic Event"
+            dt_str = item.get("Date") or item.get("DateUtc") or item.get("date")
+            if not name or not dt_str:
+                continue
+            econ.append({
+                "event": name,
+                "date": dt_str,
+                "time": None,
+                "country": "US",
+                "_te": True
+            })
+        used_te = len(econ) > 0
+
     for item in econ:
-        country = (item.get("country") or item.get("countryCode") or "").upper()
+        country = (item.get("country") or item.get("countryCode") or "US").upper()
         if country not in {"US", "USA", "UNITED STATES", "UNITED STATES OF AMERICA"}:
             continue
-        name = item.get("event") or item.get("name") or item.get("title")
-        date_raw = item.get("date") or item.get("datetime") or item.get("date_time")
+        name = item.get("event") or item.get("name") or item.get("title") or item.get("Event")
+        date_raw = item.get("date") or item.get("datetime") or item.get("date_time") or item.get("Date")
         time_raw = item.get("time")
         if not name or not date_raw:
             continue
         try:
-            if not time_raw:
-                name = f"{name} (Time TBA)"
-                dt_local = TZ.localize(datetime.combine(parser.parse(date_raw).date(), datetime.strptime("09:00","%H:%M").time()))
+            if "T" in date_raw and len(date_raw) > 10:
+                dt_local = parser.parse(date_raw)
             else:
-                dt_local = parser.parse(f"{date_raw} {time_raw}")
+                if not time_raw:
+                    name = f"{name} (Time TBA)"
+                    dt_local = TZ.localize(datetime.combine(parser.parse(date_raw).date(), datetime.strptime("09:00","%H:%M").time()))
+                else:
+                    dt_local = parser.parse(f"{date_raw} {time_raw}")
         except Exception:
             continue
+        desc = "Economic release"
+        if item.get("_te"):
+            desc += " (TE fallback)"
         events.append({
             "summary": f"{name} (Economic)",
             "dt": dt_local,
             "uid_text": f"econ::{name}::{date_raw}",
-            "description": "Economic release"
+            "description": desc
         })
 
-    # Earnings
+    # --- Earnings ---
     sp500 = fetch_sp500_symbols()
     universe = sp500.union(DOW30) if sp500 else set(DOW30)
     earn = fetch_earnings_calendar(from_str, to_str)
@@ -175,7 +222,6 @@ def collect_combined_events() -> List[dict]:
         include_all = True
         auto_expanded_now = True
 
-    # Manual test override via query string
     try:
         if request.args.get("all") == "1":
             include_all = True
@@ -278,6 +324,12 @@ def debug():
         sp_size = None if not sp else size(sp)
         auto_expanded_now = (not INCLUDE_ALL_EARNINGS_ENV and AUTO_EXPAND_EARNINGS and (sp_size in (None, 0)))
 
+        # TE probe (only if fallback enabled)
+        te_probe = None
+        if USE_TE_FALLBACK:
+            t = _get(f"{TE_BASE}/calendar/country/united states", params={"d1": from_str, "d2": to_str, "c": TE_CRED, "format": "json"})
+            te_probe = {"status": None if not t else t.status_code, "size": None if not t else size(t)}
+
         return jsonify({
             "status": "ok",
             "window": {"from": from_str, "to": to_str},
@@ -287,6 +339,8 @@ def debug():
             "earnings_size": None if not er else size(er),
             "economics_status": None if not ec else ec.status_code,
             "economics_size": None if not ec else size(ec),
+            "te_fallback_enabled": USE_TE_FALLBACK,
+            "te_probe": te_probe,
             "include_all_earnings": INCLUDE_ALL_EARNINGS_ENV,
             "auto_expand_enabled": AUTO_EXPAND_EARNINGS,
             "auto_expanded_now": auto_expanded_now,
