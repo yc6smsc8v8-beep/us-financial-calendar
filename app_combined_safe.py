@@ -7,39 +7,36 @@ from datetime import datetime, timedelta
 from dateutil import parser
 import pytz
 import requests
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, request, make_response
 from icalendar import Calendar, Event
 
 app = Flask(__name__)
 
-# =====================
-# Config (env-overridable)
-# =====================
-FMP_API_KEY = os.getenv("FMP_API_KEY", "demo")  # <-- set your real key in Render env
+# ===== Config (env) =====
+FMP_API_KEY = os.getenv("FMP_API_KEY", "demo")  # set your real key in Render
 TZ = pytz.timezone("America/New_York")
 LOOKAHEAD_DAYS = int(os.getenv("LOOKAHEAD_DAYS", "365"))
-CACHE_TTL = int(os.getenv("CACHE_TTL", "600"))
+CACHE_TTL = int(os.getenv("CACHE_TTL", "900"))
 FEED_PATH = "/us_financial_calendar.ics"
 INCLUDE_ALL_EARNINGS_ENV = os.getenv("INCLUDE_ALL_EARNINGS", "0") == "1"
+AUTO_EXPAND_EARNINGS = os.getenv("AUTO_EXPAND_EARNINGS", "0") == "1"  # auto include-all if S&P500 list missing
 
-# Endpoints (FMP stable for econ & earnings)
+# Endpoints (stable)
 FMP_STABLE_BASE = "https://financialmodelingprep.com/stable"
-FMP_V3_BASE = "https://financialmodelingprep.com/api/v3"  # for S&P500 list
-UA = {"User-Agent": "US-Financial-ICS/1.2"}
+FMP_V3_BASE = "https://financialmodelingprep.com/api/v3"  # S&P500 list
+UA = {"User-Agent": "US-Financial-ICS/1.5"}
 
-# In-memory cache
+# Cache
 _cache = {"ics": None, "ts": 0}
 
-# Universe seed (Dow 30)
+# Dow 30 seed
 DOW30 = {
     "AAPL","MSFT","JPM","V","JNJ","WMT","PG","DIS","HD","MA","XOM","PFE",
     "KO","PEP","CSCO","CVX","INTC","MCD","UNH","BAC","VZ","TRV","MMM","NKE",
     "MRK","AXP","DOW","GS","RTX","IBM"
 }
 
-# =====================
-# Helpers
-# =====================
+# ===== Helpers =====
 def sha_uid(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest() + "@us-financial-calendar"
 
@@ -49,7 +46,6 @@ def to_utc(dt: datetime) -> datetime:
     return dt.astimezone(pytz.utc)
 
 def _get(url, **kwargs):
-    # simple retry wrapper
     for i in range(3):
         try:
             r = requests.get(url, headers=UA, timeout=25, **kwargs)
@@ -68,9 +64,7 @@ def daterange_chunks(start_date: datetime, end_date: datetime, step_days: int = 
         yield cur, nxt
         cur = nxt + timedelta(days=1)
 
-# =====================
-# Fetchers (chunked)
-# =====================
+# ===== Fetchers (chunked) =====
 def fetch_sp500_symbols() -> set:
     try:
         r = _get(f"{FMP_V3_BASE}/sp500_constituent", params={"apikey": FMP_API_KEY})
@@ -112,9 +106,7 @@ def fetch_economic_calendar(from_date: str, to_date: str) -> List[dict]:
             continue
     return results
 
-# =====================
-# ICS builder (UTC + DTEND for Outlook)
-# =====================
+# ===== ICS =====
 def build_calendar(events: List[dict]) -> bytes:
     cal = Calendar()
     cal.add("prodid", "-//US Combined Economic & Earnings Calendar//")
@@ -127,7 +119,6 @@ def build_calendar(events: List[dict]) -> bytes:
     for ev in events:
         dtstart_utc = to_utc(ev["dt"])
         dtend_utc = dtstart_utc + timedelta(minutes=15)
-
         ve = Event()
         ve.add("summary", ev["summary"])
         ve.add("dtstart", dtstart_utc)
@@ -138,12 +129,9 @@ def build_calendar(events: List[dict]) -> bytes:
             ve.add("description", ev["description"])
         ve.add("transp", "OPAQUE")
         cal.add_component(ve)
-
     return cal.to_ical()
 
-# =====================
-# Compose live events
-# =====================
+# ===== Compose live events =====
 def collect_combined_events() -> List[dict]:
     events: List[dict] = []
     today = datetime.now(TZ).date()
@@ -162,22 +150,32 @@ def collect_combined_events() -> List[dict]:
         if not name or not date_raw:
             continue
         try:
-            dt_local = parser.parse(f"{date_raw} {time_raw}" if time_raw else date_raw)
+            if not time_raw:
+                name = f"{name} (Time TBA)"
+                dt_local = TZ.localize(datetime.combine(parser.parse(date_raw).date(), datetime.strptime("09:00","%H:%M").time()))
+            else:
+                dt_local = parser.parse(f"{date_raw} {time_raw}")
         except Exception:
             continue
         events.append({
             "summary": f"{name} (Economic)",
             "dt": dt_local,
-            "uid_text": f"econ::{name}::{date_raw}::{time_raw or ''}",
-            "description": "Economic release",
+            "uid_text": f"econ::{name}::{date_raw}",
+            "description": "Economic release"
         })
 
-    # Earnings (S&P500 + Dow30 by default; include all if toggled)
+    # Earnings
     sp500 = fetch_sp500_symbols()
     universe = sp500.union(DOW30) if sp500 else set(DOW30)
-
     earn = fetch_earnings_calendar(from_str, to_str)
+
     include_all = INCLUDE_ALL_EARNINGS_ENV
+    auto_expanded_now = False
+    if not include_all and AUTO_EXPAND_EARNINGS and len(sp500) == 0:
+        include_all = True
+        auto_expanded_now = True
+
+    # Manual test override via query string
     try:
         if request.args.get("all") == "1":
             include_all = True
@@ -198,53 +196,66 @@ def collect_combined_events() -> List[dict]:
         except Exception:
             continue
 
+        # Canonical times
         label = ""
+        default_et = None
         w = when.lower()
         if any(k in w for k in ["before", "pre", "bmo", "am"]):
             label = " (Pre Market)"
+            default_et = datetime.combine(dt_local.date(), datetime.strptime("08:00","%H:%M").time())
         elif any(k in w for k in ["after", "post", "pm", "after market", "amc"]):
             label = " (After Market)"
+            default_et = datetime.combine(dt_local.date(), datetime.strptime("16:10","%H:%M").time())
+        if default_et:
+            dt_local = TZ.localize(default_et)
+
+        desc = f"Earnings: {symbol} {when}".strip()
+        if auto_expanded_now and not INCLUDE_ALL_EARNINGS_ENV:
+            desc += "\nNote: Auto-expanded — S&P500 list unavailable at build time"
 
         events.append({
             "summary": f"{company} ({symbol}) - Earnings{label}",
             "dt": dt_local,
-            "uid_text": f"earn::{symbol}::{date_raw}::{when}",
-            "description": f"Earnings: {symbol} {when}",
+            "uid_text": f"earn::{symbol}::{date_raw}",
+            "description": desc,
         })
 
     events.sort(key=lambda e: to_utc(e["dt"]))
     return events
 
-# =====================
-# Routes
-# =====================
+# ===== Routes =====
 @app.route(FEED_PATH)
 def feed():
     force = request.args.get("refresh") == "1"
     now = time.time()
-
     if _cache["ics"] and not force and (now - _cache["ts"] < CACHE_TTL):
-        return Response(_cache["ics"], mimetype="text/calendar; charset=utf-8")
-
-    try:
+        ics = _cache["ics"]
+    else:
         events = collect_combined_events()
         if not events:
-            # Fallback snapshot so subscribers always see something
             tznow = datetime.now(TZ)
-            events = [
-                {"summary": "Fallback GDP (Economic)", "dt": tznow + timedelta(days=1), "uid_text": "fallback-econ-1", "description": "Temporary fallback"},
-                {"summary": "Fallback Earnings (AAPL) - After Market", "dt": tznow + timedelta(days=2), "uid_text": "fallback-earn-1", "description": "Temporary fallback"},
-            ]
+            events = [{"summary": "Fallback GDP (Economic)", "dt": tznow + timedelta(days=1)}]
         ics = build_calendar(events)
-    except Exception:
-        cal = Calendar()
-        cal.add("prodid", "-//US Combined Economic & Earnings Calendar//")
-        cal.add("version", "2.0")
-        ics = cal.to_ical()
+        _cache["ics"] = ics
+        _cache["ts"] = now
 
-    _cache["ics"] = ics
-    _cache["ts"] = now
-    return Response(ics, mimetype="text/calendar; charset=utf-8")
+    resp = make_response(ics)
+    resp.mimetype = "text/calendar; charset=utf-8"
+    etag = hashlib.sha1(ics).hexdigest()
+    resp.headers["ETag"] = etag
+    resp.headers["Last-Modified"] = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
+    return resp
+
+@app.route("/warm")
+def warm():
+    try:
+        events = collect_combined_events()
+        ics = build_calendar(events)
+        _cache["ics"] = ics
+        _cache["ts"] = time.time()
+        return jsonify({"status": "ok", "events": len(events)})
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 @app.route("/debug")
 def debug():
@@ -264,17 +275,21 @@ def debug():
             except Exception:
                 return -1
 
+        sp_size = None if not sp else size(sp)
+        auto_expanded_now = (not INCLUDE_ALL_EARNINGS_ENV and AUTO_EXPAND_EARNINGS and (sp_size in (None, 0)))
+
         return jsonify({
             "status": "ok",
             "window": {"from": from_str, "to": to_str},
             "sp500_status": None if not sp else sp.status_code,
-            "sp500_size": None if not sp else size(sp),
+            "sp500_size": sp_size,
             "earnings_status": None if not er else er.status_code,
             "earnings_size": None if not er else size(er),
             "economics_status": None if not ec else ec.status_code,
             "economics_size": None if not ec else size(ec),
             "include_all_earnings": INCLUDE_ALL_EARNINGS_ENV,
-            "using_key_prefix": (FMP_API_KEY[:4] + "***") if FMP_API_KEY else None
+            "auto_expand_enabled": AUTO_EXPAND_EARNINGS,
+            "auto_expanded_now": auto_expanded_now,
         })
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
@@ -286,11 +301,10 @@ def health():
 @app.route("/")
 def index():
     return (
-        "<h3>US Economic & Earnings Calendar is running (stable endpoints).</h3>"
-        f'<p>Subscribe to the ICS feed: <a href="{FEED_PATH}">{FEED_PATH}</a></p>'
+        "<h3>US Economic & Earnings Calendar is running.</h3>"
+        f'<p>Subscribe: <a href="{FEED_PATH}">{FEED_PATH}</a></p>'
         '<p>Health: <a href="/health">/health</a> | Debug: <a href="/debug">/debug</a></p>'
-        '<p>Force refresh: <a href="/us_financial_calendar.ics?refresh=1">/us_financial_calendar.ics?refresh=1</a></p>'
-        '<p>Include all earnings (test): append <code>&all=1</code> to the feed URL.</p>'
+        '<p>Warm cache: <a href="/warm">/warm</a> | Refresh ICS: <a href="/us_financial_calendar.ics?refresh=1">feed</a></p>'
     )
 
 if __name__ == "__main__":
