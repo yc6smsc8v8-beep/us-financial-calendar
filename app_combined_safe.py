@@ -1,3 +1,4 @@
+
 import os
 import time
 import hashlib
@@ -11,26 +12,34 @@ from icalendar import Calendar, Event
 
 app = Flask(__name__)
 
-# --- Config ---
-FMP_API_KEY = os.getenv("FMP_API_KEY", "jGOOgPs7zXMPkcultsP6M01SrYIm15nV")  # override in Render env
+# =====================
+# Config (env-overridable)
+# =====================
+FMP_API_KEY = os.getenv("FMP_API_KEY", "demo")  # <-- set your real key in Render env
 TZ = pytz.timezone("America/New_York")
 LOOKAHEAD_DAYS = int(os.getenv("LOOKAHEAD_DAYS", "365"))
-CACHE_TTL = int(os.getenv("CACHE_TTL", "900"))
+CACHE_TTL = int(os.getenv("CACHE_TTL", "600"))
 FEED_PATH = "/us_financial_calendar.ics"
 INCLUDE_ALL_EARNINGS_ENV = os.getenv("INCLUDE_ALL_EARNINGS", "0") == "1"
 
-# --- Cache ---
+# Endpoints (FMP stable for econ & earnings)
+FMP_STABLE_BASE = "https://financialmodelingprep.com/stable"
+FMP_V3_BASE = "https://financialmodelingprep.com/api/v3"  # for S&P500 list
+UA = {"User-Agent": "US-Financial-ICS/1.2"}
+
+# In-memory cache
 _cache = {"ics": None, "ts": 0}
 
-# --- Universe for earnings filtering ---
+# Universe seed (Dow 30)
 DOW30 = {
     "AAPL","MSFT","JPM","V","JNJ","WMT","PG","DIS","HD","MA","XOM","PFE",
     "KO","PEP","CSCO","CVX","INTC","MCD","UNH","BAC","VZ","TRV","MMM","NKE",
     "MRK","AXP","DOW","GS","RTX","IBM"
 }
-FMP_BASE = "https://financialmodelingprep.com/api/v3"
-UA = {"User-Agent": "US-Financial-ICS/1.0"}
 
+# =====================
+# Helpers
+# =====================
 def sha_uid(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest() + "@us-financial-calendar"
 
@@ -40,7 +49,7 @@ def to_utc(dt: datetime) -> datetime:
     return dt.astimezone(pytz.utc)
 
 def _get(url, **kwargs):
-    # retry helper
+    # simple retry wrapper
     for i in range(3):
         try:
             r = requests.get(url, headers=UA, timeout=25, **kwargs)
@@ -59,15 +68,17 @@ def daterange_chunks(start_date: datetime, end_date: datetime, step_days: int = 
         yield cur, nxt
         cur = nxt + timedelta(days=1)
 
-# --- Fetchers (chunked) ---
+# =====================
+# Fetchers (chunked)
+# =====================
 def fetch_sp500_symbols() -> set:
     try:
-        r = _get(f"{FMP_BASE}/sp500_constituent", params={"apikey": FMP_API_KEY})
-        if not r:
-            return set()
-        return {row.get("symbol","").upper() for row in r.json() if row.get("symbol")}
+        r = _get(f"{FMP_V3_BASE}/sp500_constituent", params={"apikey": FMP_API_KEY})
+        if r:
+            return {row.get("symbol","").upper() for row in r.json() if row.get("symbol")}
     except Exception:
-        return set()
+        pass
+    return set()
 
 def fetch_earnings_calendar(from_date: str, to_date: str) -> List[dict]:
     results = []
@@ -75,7 +86,7 @@ def fetch_earnings_calendar(from_date: str, to_date: str) -> List[dict]:
     end = datetime.fromisoformat(to_date)
     for s, e in daterange_chunks(start, end, step_days=60):
         try:
-            r = _get(f"{FMP_BASE}/earning_calendar",
+            r = _get(f"{FMP_STABLE_BASE}/earnings-calendar",
                      params={"from": s.date().isoformat(), "to": e.date().isoformat(), "apikey": FMP_API_KEY})
             if r:
                 data = r.json()
@@ -91,7 +102,7 @@ def fetch_economic_calendar(from_date: str, to_date: str) -> List[dict]:
     end = datetime.fromisoformat(to_date)
     for s, e in daterange_chunks(start, end, step_days=60):
         try:
-            r = _get(f"{FMP_BASE}/economic_calendar",
+            r = _get(f"{FMP_STABLE_BASE}/economic-calendar",
                      params={"from": s.date().isoformat(), "to": e.date().isoformat(), "apikey": FMP_API_KEY})
             if r:
                 data = r.json()
@@ -101,7 +112,9 @@ def fetch_economic_calendar(from_date: str, to_date: str) -> List[dict]:
             continue
     return results
 
-# --- Build ICS (UTC + DTEND to satisfy Outlook) ---
+# =====================
+# ICS builder (UTC + DTEND for Outlook)
+# =====================
 def build_calendar(events: List[dict]) -> bytes:
     cal = Calendar()
     cal.add("prodid", "-//US Combined Economic & Earnings Calendar//")
@@ -128,7 +141,9 @@ def build_calendar(events: List[dict]) -> bytes:
 
     return cal.to_ical()
 
-# --- Compose live events ---
+# =====================
+# Compose live events
+# =====================
 def collect_combined_events() -> List[dict]:
     events: List[dict] = []
     today = datetime.now(TZ).date()
@@ -157,13 +172,12 @@ def collect_combined_events() -> List[dict]:
             "description": "Economic release",
         })
 
-    # Earnings (S&P500 + Dow30 by default; can include all via env/param)
+    # Earnings (S&P500 + Dow30 by default; include all if toggled)
     sp500 = fetch_sp500_symbols()
     universe = sp500.union(DOW30) if sp500 else set(DOW30)
 
     earn = fetch_earnings_calendar(from_str, to_str)
     include_all = INCLUDE_ALL_EARNINGS_ENV
-    # allow override via query (?all=1) when testing in browser
     try:
         if request.args.get("all") == "1":
             include_all = True
@@ -201,7 +215,9 @@ def collect_combined_events() -> List[dict]:
     events.sort(key=lambda e: to_utc(e["dt"]))
     return events
 
-# --- Routes ---
+# =====================
+# Routes
+# =====================
 @app.route(FEED_PATH)
 def feed():
     force = request.args.get("refresh") == "1"
@@ -213,7 +229,7 @@ def feed():
     try:
         events = collect_combined_events()
         if not events:
-            # Fallback snapshot to keep subscribers seeing something
+            # Fallback snapshot so subscribers always see something
             tznow = datetime.now(TZ)
             events = [
                 {"summary": "Fallback GDP (Economic)", "dt": tznow + timedelta(days=1), "uid_text": "fallback-econ-1", "description": "Temporary fallback"},
@@ -237,38 +253,44 @@ def debug():
         to_date = today + timedelta(days=LOOKAHEAD_DAYS)
         from_str, to_str = today.isoformat(), to_date.isoformat()
 
-        econ_raw = fetch_economic_calendar(from_str, to_str)
-        earn_raw = fetch_earnings_calendar(from_str, to_str)
-        sp500 = fetch_sp500_symbols()
+        sp = _get(f"{FMP_V3_BASE}/sp500_constituent", params={"apikey": FMP_API_KEY})
+        er = _get(f"{FMP_STABLE_BASE}/earnings-calendar", params={"from": from_str, "to": to_str, "apikey": FMP_API_KEY})
+        ec = _get(f"{FMP_STABLE_BASE}/economic-calendar", params={"from": from_str, "to": to_str, "apikey": FMP_API_KEY})
 
-        econ_us = [x for x in econ_raw if (x.get("country") or x.get("countryCode") or "").upper() in {"US","USA","UNITED STATES","UNITED STATES OF AMERICA"}]
-        earn_symbols = { (x.get("symbol") or "").upper() for x in earn_raw }
+        def size(resp):
+            try:
+                data = resp.json()
+                return len(data) if isinstance(data, list) else 1
+            except Exception:
+                return -1
+
         return jsonify({
             "status": "ok",
             "window": {"from": from_str, "to": to_str},
-            "raw_counts": {"economic": len(econ_raw), "economic_us": len(econ_us), "earnings_raw": len(earn_raw), "earn_symbols_unique": len(earn_symbols)},
-            "sp500_count": len(sp500),
+            "sp500_status": None if not sp else sp.status_code,
+            "sp500_size": None if not sp else size(sp),
+            "earnings_status": None if not er else er.status_code,
+            "earnings_size": None if not er else size(er),
+            "economics_status": None if not ec else ec.status_code,
+            "economics_size": None if not ec else size(ec),
             "include_all_earnings": INCLUDE_ALL_EARNINGS_ENV,
+            "using_key_prefix": (FMP_API_KEY[:4] + "***") if FMP_API_KEY else None
         })
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
 @app.route("/health")
 def health():
-    return jsonify({
-        "status": "ok",
-        "feed_path": FEED_PATH,
-        "cached_seconds": CACHE_TTL
-    })
+    return jsonify({"status": "ok", "feed_path": FEED_PATH, "cached_seconds": CACHE_TTL})
 
 @app.route("/")
 def index():
     return (
-        "<h3>US Economic & Earnings Calendar is running.</h3>"
+        "<h3>US Economic & Earnings Calendar is running (stable endpoints).</h3>"
         f'<p>Subscribe to the ICS feed: <a href="{FEED_PATH}">{FEED_PATH}</a></p>'
         '<p>Health: <a href="/health">/health</a> | Debug: <a href="/debug">/debug</a></p>'
-        '<p>Force refresh: <a href="/us_financial_calendar.ics?refresh=1">/us_financial_calendar.ics?refresh=1</a> '
-        ' | Include all earnings (test only): <a href="/us_financial_calendar.ics?refresh=1&all=1">/us_financial_calendar.ics?refresh=1&all=1</a></p>'
+        '<p>Force refresh: <a href="/us_financial_calendar.ics?refresh=1">/us_financial_calendar.ics?refresh=1</a></p>'
+        '<p>Include all earnings (test): append <code>&all=1</code> to the feed URL.</p>'
     )
 
 if __name__ == "__main__":

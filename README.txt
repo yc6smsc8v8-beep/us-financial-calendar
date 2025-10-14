@@ -1,18 +1,17 @@
-US Economic + S&P500/Dow30 Earnings — Live ICS (Chunked, Resilient, Outlook-safe)
+US Economic + Earnings — Live ICS (Latest build)
+- Uses FMP **stable** endpoints for economic & earnings calendars.
+- Chunked API calls (60-day windows), retries, and server caching.
+- Outlook-safe ICS (UTC + 15-min DTEND).
+- Debug endpoint `/debug` shows HTTP status and list sizes.
+- Cache-bypass: append `?refresh=1` to the feed URL.
+- Earnings filter: S&P 500 + Dow30 by default; set env `INCLUDE_ALL_EARNINGS=1` or use `&all=1` to include all.
 
-- Feed: /us_financial_calendar.ics  (add ?refresh=1 to bypass cache)
-- Debug: /debug  (shows raw counts & window)
-- Test toggle: ?all=1 includes all earnings symbols
-- Outlook-safe: UTC timestamps + 15-min DTEND
-- Chunked API fetch (60-day windows) to avoid provider caps
+Render → Settings → Environment:
+- FMP_API_KEY=<your key with stable endpoint access>
+- LOOKAHEAD_DAYS=365
+- CACHE_TTL=600
+- INCLUDE_ALL_EARNINGS=1   # (optional for testing)
 
-Deploy on Render (Docker):
-1) Push these three files to GitHub.
-2) Render → New Web Service → Environment: Docker → connect repo.
-3) Settings → Environment (recommended):
-   - FMP_API_KEY=<your key>
-   - LOOKAHEAD_DAYS=365
-   - CACHE_TTL=300  (while testing; raise later)
-   - INCLUDE_ALL_EARNINGS=1  (test only; remove/0 later)
-4) Manual Deploy → Deploy Latest Commit.
-5) Verify /debug and /us_financial_calendar.ics?refresh=1.
+Feed URL:   /us_financial_calendar.ics
+Health:     /health
+Debug:      /debug
