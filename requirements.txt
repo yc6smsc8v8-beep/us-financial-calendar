@@ -1,0 +1,4 @@
+Flask>=2.0
+icalendar>=4.0
+pytz
+gunicorn>=23.0
